@@ -2,8 +2,17 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import { VitePWA } from 'vite-plugin-pwa';
 
+declare const process: { env: Record<string, string | undefined> };
+
+const buildHash = (process.env.GITHUB_SHA ?? 'dev').slice(0, 7);
+const buildTime = new Date().toISOString();
+
 export default defineConfig({
   base: '/spendtrack/',
+  define: {
+    __BUILD_HASH__: JSON.stringify(buildHash),
+    __BUILD_TIME__: JSON.stringify(buildTime),
+  },
   plugins: [
     react(),
     VitePWA({

@@ -20,10 +20,9 @@ export interface DocBundle {
   destroy: () => Promise<void>;
 }
 
-const SIGNALING_SERVERS = [
+export const SIGNALING_SERVERS = [
+  'wss://y-webrtc-eu.fly.dev',
   'wss://signaling.yjs.dev',
-  'wss://y-webrtc-signaling-eu.herokuapp.com',
-  'wss://y-webrtc-signaling-us.herokuapp.com',
 ];
 
 export async function openDoc(pairing: StoredPairing | null): Promise<DocBundle> {
