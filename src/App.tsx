@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as Y from 'yjs';
 import { useDoc } from './hooks/useDoc';
 import { BalanceCard } from './components/BalanceCard';
+import { DebugPanel } from './components/DebugPanel';
 import { ExpenseForm } from './components/ExpenseForm';
 import { ExpenseList } from './components/ExpenseList';
 import { Modal } from './components/Modal';
@@ -9,6 +10,7 @@ import { PairingScreen } from './components/PairingScreen';
 import { SettingsScreen } from './components/SettingsScreen';
 import { SettlementForm } from './components/SettlementForm';
 import { SyncStatus } from './components/SyncStatus';
+import { Toast } from './components/Toast';
 import { netFromExpenses, totalForMonth } from './lib/balance';
 import {
   findIndexById,
@@ -17,7 +19,7 @@ import {
   writeSettlement,
 } from './lib/doc';
 import { loadStoredPairing, type StoredPairing } from './lib/pairing';
-import type { Expense, Settlement, UserId } from './lib/schema';
+import { partner, type Expense, type Settlement, type UserId } from './lib/schema';
 
 type Sheet =
   | { kind: 'none' }
@@ -29,17 +31,44 @@ interface PendingIdentity {
   labels: { A: string; B: string };
 }
 
+function urlHasDebug(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return new URL(window.location.href).searchParams.get('debug') === '1';
+  } catch {
+    return false;
+  }
+}
+
 export default function App() {
   const [pairing, setPairing] = useState<StoredPairing | null>(() => loadStoredPairing());
   const [skippedPairing, setSkippedPairing] = useState(false);
   const [pendingIdentity, setPendingIdentity] = useState<PendingIdentity | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [debugOpen, setDebugOpen] = useState(() => urlHasDebug());
   const [sheet, setSheet] = useState<Sheet>({ kind: 'none' });
-
-  const showPairing = !pairing && !skippedPairing;
+  const [toastMsg, setToastMsg] = useState<string | null>(null);
 
   const docState = useDoc(pairing);
-  const { bundle, ready, expenses, settlements, settings, syncState, peerCount } = docState;
+  const {
+    bundle,
+    ready,
+    expenses,
+    settlements,
+    settings,
+    syncState,
+    peerCount,
+    bcPeerCount,
+    awarenessCount,
+    signalingStatuses,
+    online,
+    hasSignaling,
+    lastSyncAt,
+    lastUpdateAt,
+  } = docState;
+
+  const synced = lastSyncAt != null && peerCount > 0;
+  const showPairing = !settings.paired && !skippedPairing;
 
   useEffect(() => {
     if (!ready || !bundle || !pendingIdentity) return;
@@ -53,6 +82,15 @@ export default function App() {
     });
     setPendingIdentity(null);
   }, [ready, bundle, pendingIdentity]);
+
+  const wasPairedRef = useRef(settings.paired);
+  useEffect(() => {
+    if (!wasPairedRef.current && settings.paired) {
+      const partnerName = settings.labels[partner(settings.selfId)] || 'partner';
+      setToastMsg(`Connected to ${partnerName}`);
+    }
+    wasPairedRef.current = settings.paired;
+  }, [settings.paired, settings.labels, settings.selfId]);
 
   const balance = useMemo(
     () => netFromExpenses(expenses, settlements, settings.selfId, settings.primaryCurrency),
@@ -72,11 +110,16 @@ export default function App() {
     [expenses, monthKey, settings.primaryCurrency],
   );
 
-  function onPairingComplete(self: UserId, labels: { A: string; B: string }) {
-    const stored = loadStoredPairing();
-    setPendingIdentity({ self, labels });
+  const onPairingPersisted = useCallback((stored: StoredPairing) => {
     setPairing(stored);
-  }
+  }, []);
+
+  const onIdentityChosen = useCallback(
+    (self: UserId, labels: { A: string; B: string }) => {
+      setPendingIdentity({ self, labels });
+    },
+    [],
+  );
 
   function saveExpense(e: Expense) {
     if (!bundle) return;
@@ -128,40 +171,118 @@ export default function App() {
     setSkippedPairing(false);
   }
 
+  const titlePressTimer = useRef<number | null>(null);
+  const titleLongPressFired = useRef(false);
+  const titleProps = {
+    onPointerDown: () => {
+      titleLongPressFired.current = false;
+      titlePressTimer.current = window.setTimeout(() => {
+        titleLongPressFired.current = true;
+        setDebugOpen(true);
+      }, 600);
+    },
+    onPointerUp: () => {
+      if (titlePressTimer.current != null) {
+        window.clearTimeout(titlePressTimer.current);
+        titlePressTimer.current = null;
+      }
+    },
+    onPointerLeave: () => {
+      if (titlePressTimer.current != null) {
+        window.clearTimeout(titlePressTimer.current);
+        titlePressTimer.current = null;
+      }
+    },
+    onPointerCancel: () => {
+      if (titlePressTimer.current != null) {
+        window.clearTimeout(titlePressTimer.current);
+        titlePressTimer.current = null;
+      }
+    },
+  };
+
+  const signalingCount = signalingStatuses.length;
+  const signalingConnected = signalingStatuses.filter((s) => s.connected).length;
+
+  const debugPanel = (
+    <DebugPanel
+      open={debugOpen}
+      onClose={() => setDebugOpen(false)}
+      bundle={bundle}
+      pairing={pairing}
+      signalingStatuses={signalingStatuses}
+      peerCount={peerCount}
+      bcPeerCount={bcPeerCount}
+      awarenessCount={awarenessCount}
+      online={online}
+      lastSyncAt={lastSyncAt}
+      lastUpdateAt={lastUpdateAt}
+      expenseCount={expenses.length}
+      settlementCount={settlements.length}
+    />
+  );
+
   if (showPairing) {
     return (
-      <PairingScreen
-        onComplete={onPairingComplete}
-        onSkip={() => setSkippedPairing(true)}
-      />
+      <>
+        <PairingScreen
+          hasSignaling={hasSignaling}
+          signalingCount={signalingCount}
+          signalingConnected={signalingConnected}
+          hasPeer={peerCount > 0}
+          synced={synced}
+          bundleReady={ready}
+          pairingActive={!!pairing}
+          existingPassphrase={pairing?.passphrase}
+          onPersisted={onPairingPersisted}
+          onIdentityChosen={onIdentityChosen}
+          onSkip={() => setSkippedPairing(true)}
+          onOpenDebug={() => setDebugOpen(true)}
+        />
+        {debugPanel}
+      </>
     );
   }
 
   if (!ready || !bundle) {
     return (
-      <div className="flex min-h-full items-center justify-center text-slate-500">
-        Loading…
-      </div>
+      <>
+        <div className="flex min-h-full items-center justify-center text-slate-500">Loading…</div>
+        {debugPanel}
+      </>
     );
   }
 
   if (showSettings) {
     return (
-      <SettingsScreen
-        bundle={bundle}
-        settings={settings}
-        onClose={() => setShowSettings(false)}
-        onUnpair={unpair}
-      />
+      <>
+        <SettingsScreen
+          bundle={bundle}
+          settings={settings}
+          onClose={() => setShowSettings(false)}
+          onUnpair={unpair}
+        />
+        {debugPanel}
+      </>
     );
   }
 
   return (
     <div className="mx-auto flex min-h-full max-w-md flex-col gap-4 p-4 pb-24">
       <header className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold">Spendtrack</h1>
+        <h1
+          className="select-none text-2xl font-bold"
+          {...titleProps}
+          title="Long-press for debug info"
+        >
+          Spendtrack
+        </h1>
         <div className="flex items-center gap-2">
-          <SyncStatus state={syncState} peerCount={peerCount} paired={!!pairing} />
+          <SyncStatus
+            state={syncState}
+            peerCount={peerCount}
+            onClick={() => setDebugOpen(true)}
+          />
           <button
             className="rounded-full p-2 text-slate-500 hover:bg-slate-200 dark:text-slate-300 dark:hover:bg-slate-800"
             onClick={() => setShowSettings(true)}
@@ -250,6 +371,9 @@ export default function App() {
           />
         )}
       </Modal>
+
+      <Toast message={toastMsg} onDismiss={() => setToastMsg(null)} />
+      {debugPanel}
     </div>
   );
 }
