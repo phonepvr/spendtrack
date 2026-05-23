@@ -1,6 +1,5 @@
 import * as Y from 'yjs';
 import { IndexeddbPersistence } from 'y-indexeddb';
-import { WebrtcProvider } from 'y-webrtc';
 import {
   DEFAULT_SETTINGS,
   type Expense,
@@ -16,14 +15,8 @@ export interface DocBundle {
   settlements: Y.Array<Y.Map<unknown>>;
   settings: Y.Map<unknown>;
   persistence: IndexeddbPersistence;
-  webrtc: WebrtcProvider | null;
   destroy: () => Promise<void>;
 }
-
-export const SIGNALING_SERVERS = [
-  'wss://y-webrtc-eu.fly.dev',
-  'wss://signaling.yjs.dev',
-];
 
 export async function openDoc(pairing: StoredPairing | null): Promise<DocBundle> {
   const doc = new Y.Doc();
@@ -43,25 +36,12 @@ export async function openDoc(pairing: StoredPairing | null): Promise<DocBundle>
     });
   }
 
-  let webrtc: WebrtcProvider | null = null;
-  if (pairing) {
-    webrtc = new WebrtcProvider(pairing.roomId, doc, {
-      signaling: SIGNALING_SERVERS,
-      password: pairing.webrtcPassword,
-      maxConns: 4,
-      filterBcConns: true,
-    });
-  }
-
   const destroy = async () => {
-    if (webrtc) {
-      webrtc.destroy();
-    }
     await persistence.destroy();
     doc.destroy();
   };
 
-  return { doc, expenses, settlements, settings, persistence, webrtc, destroy };
+  return { doc, expenses, settlements, settings, persistence, destroy };
 }
 
 export function readSettings(map: Y.Map<unknown>): Settings {

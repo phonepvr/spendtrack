@@ -1,8 +1,40 @@
 # Spendtrack export format
 
-Your data is yours. This document describes the JSON you get when you tap **Export JSON backup** in Settings, so that if Spendtrack itself ever disappears you can still recover your records with nothing but a text editor and basic scripting.
+Your data is yours. This document describes both file formats Spendtrack produces:
+- **Encrypted sync envelope** (`.spendtrack`): what you send to your partner. Encrypted with your shared passphrase.
+- **Plain backup** (`.json`): what you download for your own records. Unencrypted.
 
-## Top-level structure
+If Spendtrack itself ever disappears, you can recover your records from either format with nothing but a text editor and basic scripting.
+
+## Encrypted sync envelope (`.spendtrack`)
+
+```json
+{
+  "format": "spendtrack/v1/encrypted",
+  "iv": "<base64 12-byte AES-GCM nonce>",
+  "ciphertext": "<base64 AES-GCM ciphertext>",
+  "pairingHint": "<base64url 4-byte HKDF hint>",
+  "exportedAt": 1747958400000,
+  "sourceId": "A"
+}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `format` | string | Always `"spendtrack/v1/encrypted"`. |
+| `iv` | string | Base64-encoded 12-byte initialization vector for AES-GCM. |
+| `ciphertext` | string | Base64-encoded AES-GCM ciphertext. Decrypts to the plain backup JSON below. |
+| `pairingHint` | string | Base64url-encoded 4 bytes = `HKDF(passphrase, "spendtrack/v1/hint", info="spendtrack-pairing")`. Non-secret; the receiving app uses it to detect wrong-pairing files before attempting decryption. |
+| `exportedAt` | number | Unix epoch ms (also stored inside the encrypted payload). |
+| `sourceId` | `"A" \| "B"` | Which side generated this file (also inside the encrypted payload). |
+
+**Decryption:**
+1. Derive `fileKey = HKDF(passphrase, "spendtrack/v1/file", info="spendtrack-pairing")` → 32 bytes for AES-GCM-256.
+2. `AES-GCM-256.decrypt(iv, ciphertext, fileKey)` → UTF-8 JSON of the plain backup format below.
+
+The passphrase is the same one you used during pairing. HKDF inputs use SHA-256.
+
+## Plain backup (`.json`)
 
 ```json
 {
@@ -10,7 +42,8 @@ Your data is yours. This document describes the JSON you get when you tap **Expo
   "exportedAt": 1747958400000,
   "expenses": [ /* Expense objects */ ],
   "settlements": [ /* Settlement objects */ ],
-  "yjsUpdate": "<base64-encoded CRDT state>"
+  "yjsUpdate": "<base64-encoded CRDT state>",
+  "sourceId": "A"
 }
 ```
 

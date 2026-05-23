@@ -20,8 +20,9 @@ import {
 } from './lib/doc';
 import {
   exportSnapshot,
-  getLastExportAt,
-  shareOrDownload,
+  importFile,
+  shareSyncFile,
+  WrongPairingError,
 } from './lib/exportImport';
 import { loadStoredPairing, type StoredPairing } from './lib/pairing';
 import { partner, type Expense, type Settlement, type UserId } from './lib/schema';
@@ -36,6 +37,11 @@ interface PendingIdentity {
   labels: { A: string; B: string };
 }
 
+interface PendingImport {
+  filename: string;
+  raw: string;
+}
+
 function urlHasDebug(): boolean {
   if (typeof window === 'undefined') return false;
   try {
@@ -45,39 +51,56 @@ function urlHasDebug(): boolean {
   }
 }
 
-const BACKUP_NUDGE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
-const BACKUP_NUDGE_DISMISS_MS = 24 * 60 * 60 * 1000;
+const SYNC_NUDGE_STALE_MS = 3 * 24 * 60 * 60 * 1000;
+const NUDGE_DISMISS_MS = 24 * 60 * 60 * 1000;
 
-interface BackupNudgeProps {
+interface SyncNudgeProps {
   recordCount: number;
+  lastUpdateAt: number | null;
+  lastSentAt: number | null;
+  lastReceivedAt: number | null;
+  partnerName: string;
   dismissedAt: number | null;
   onDismiss: () => void;
-  onBackup: () => void;
+  onSend: () => void;
 }
 
-function BackupNudge({ recordCount, dismissedAt, onDismiss, onBackup }: BackupNudgeProps) {
-  const lastExport = getLastExportAt();
+function SyncNudge({
+  recordCount,
+  lastUpdateAt,
+  lastSentAt,
+  lastReceivedAt,
+  partnerName,
+  dismissedAt,
+  onDismiss,
+  onSend,
+}: SyncNudgeProps) {
   const now = Date.now();
   if (recordCount === 0) return null;
-  if (dismissedAt && now - dismissedAt < BACKUP_NUDGE_DISMISS_MS) return null;
-  if (lastExport && now - lastExport < BACKUP_NUDGE_AFTER_MS) return null;
-  const daysSince = lastExport ? Math.floor((now - lastExport) / 86_400_000) : null;
+  if (dismissedAt && now - dismissedAt < NUDGE_DISMISS_MS) return null;
+
+  const lastTouch = Math.max(lastSentAt ?? 0, lastReceivedAt ?? 0) || null;
+  const hasUnshared = lastUpdateAt != null && lastUpdateAt > (lastSentAt ?? 0);
+  const stale = lastTouch != null && now - lastTouch > SYNC_NUDGE_STALE_MS;
+
+  if (!hasUnshared && !stale && lastTouch != null) return null;
+
+  const headline = hasUnshared
+    ? `Share your changes with ${partnerName}`
+    : lastTouch == null
+      ? 'Time to sync with your partner'
+      : `It’s been ${Math.floor((now - lastTouch) / 86_400_000)} days since you synced`;
+
   return (
     <div className="flex items-start gap-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm dark:border-amber-900/50 dark:bg-amber-900/20">
       <div className="flex-1">
-        <div className="font-medium text-amber-900 dark:text-amber-200">Back up your data</div>
+        <div className="font-medium text-amber-900 dark:text-amber-200">{headline}</div>
         <div className="text-xs text-amber-800 dark:text-amber-300">
-          {daysSince == null
-            ? 'You haven’t exported a backup yet.'
-            : `Last backup was ${daysSince} day${daysSince === 1 ? '' : 's'} ago.`}
+          Sends an encrypted file your partner can import in one tap.
         </div>
       </div>
-      <button
-        type="button"
-        className="btn-primary px-3 py-1 text-xs"
-        onClick={onBackup}
-      >
-        Back up
+      <button type="button" className="btn-primary px-3 py-1 text-xs" onClick={onSend}>
+        Send
       </button>
       <button
         type="button"
@@ -91,6 +114,14 @@ function BackupNudge({ recordCount, dismissedAt, onDismiss, onBackup }: BackupNu
   );
 }
 
+interface LaunchParams {
+  files?: FileSystemFileHandle[];
+}
+
+interface LaunchQueue {
+  setConsumer: (cb: (params: LaunchParams) => void) => void;
+}
+
 export default function App() {
   const [pairing, setPairing] = useState<StoredPairing | null>(null);
   const [pairingLoaded, setPairingLoaded] = useState(false);
@@ -100,7 +131,9 @@ export default function App() {
   const [debugOpen, setDebugOpen] = useState(() => urlHasDebug());
   const [sheet, setSheet] = useState<Sheet>({ kind: 'none' });
   const [toastMsg, setToastMsg] = useState<string | null>(null);
-  const [backupBannerDismissedAt, setBackupBannerDismissedAt] = useState<number | null>(null);
+  const [nudgeDismissedAt, setNudgeDismissedAt] = useState<number | null>(null);
+  const [pendingImport, setPendingImport] = useState<PendingImport | null>(null);
+  const [importBusy, setImportBusy] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -122,17 +155,13 @@ export default function App() {
     settlements,
     settings,
     syncState,
-    peerCount,
-    bcPeerCount,
-    awarenessCount,
-    signalingStatuses,
     online,
-    hasSignaling,
-    lastSyncAt,
     lastUpdateAt,
+    lastSentAt,
+    lastReceivedAt,
+    partnerLastUpdateAt,
   } = docState;
 
-  const synced = lastSyncAt != null && peerCount > 0;
   const showPairing = pairingLoaded && !settings.paired && !skippedPairing;
 
   useEffect(() => {
@@ -148,14 +177,21 @@ export default function App() {
     setPendingIdentity(null);
   }, [ready, bundle, pendingIdentity]);
 
-  const wasPairedRef = useRef(settings.paired);
   useEffect(() => {
-    if (!wasPairedRef.current && settings.paired) {
-      const partnerName = settings.labels[partner(settings.selfId)] || 'partner';
-      setToastMsg(`Connected to ${partnerName}`);
-    }
-    wasPairedRef.current = settings.paired;
-  }, [settings.paired, settings.labels, settings.selfId]);
+    const w = window as unknown as { launchQueue?: LaunchQueue };
+    if (!w.launchQueue) return;
+    w.launchQueue.setConsumer(async (params) => {
+      const handles = params.files ?? [];
+      if (handles.length === 0) return;
+      try {
+        const file = await handles[0].getFile();
+        const text = await file.text();
+        setPendingImport({ filename: file.name, raw: text });
+      } catch (e) {
+        setToastMsg('Could not read shared file: ' + (e instanceof Error ? e.message : 'unknown'));
+      }
+    });
+  }, []);
 
   const balance = useMemo(
     () => netFromExpenses(expenses, settlements, settings.selfId, settings.primaryCurrency),
@@ -236,13 +272,62 @@ export default function App() {
     setSkippedPairing(false);
   }
 
+  const partnerName = settings.labels[partner(settings.selfId)] || 'partner';
+  const recordCount = expenses.length + settlements.length;
+
+  async function sendToPartner() {
+    if (!bundle || !pairing) {
+      setToastMsg('Pair a partner first to send updates.');
+      return;
+    }
+    try {
+      const payload = exportSnapshot(bundle, settings.selfId);
+      const result = await shareSyncFile(payload, pairing.passphrase, partnerName);
+      setToastMsg(
+        result === 'shared'
+          ? `Shared with ${partnerName}.`
+          : `Saved file — send it to ${partnerName}.`,
+      );
+    } catch (e) {
+      setToastMsg('Send failed: ' + (e instanceof Error ? e.message : 'unknown'));
+    }
+  }
+
+  async function confirmPendingImport() {
+    if (!bundle || !pendingImport) return;
+    setImportBusy(true);
+    try {
+      const result = await importFile(
+        bundle,
+        pendingImport.raw,
+        pairing?.passphrase ?? null,
+        'merge-yjs',
+      );
+      const fromName =
+        result.sourceId && result.sourceId !== settings.selfId
+          ? settings.labels[result.sourceId] || partnerName
+          : partnerName;
+      setToastMsg(
+        result.added > 0
+          ? `Merged ${result.added} new entr${result.added === 1 ? 'y' : 'ies'} from ${fromName}.`
+          : `Already in sync with ${fromName}.`,
+      );
+    } catch (e) {
+      if (e instanceof WrongPairingError) {
+        setToastMsg('This file isn’t from your pairing partner.');
+      } else {
+        setToastMsg('Import failed: ' + (e instanceof Error ? e.message : 'unknown'));
+      }
+    } finally {
+      setImportBusy(false);
+      setPendingImport(null);
+    }
+  }
+
   const titlePressTimer = useRef<number | null>(null);
-  const titleLongPressFired = useRef(false);
   const titleProps = {
     onPointerDown: () => {
-      titleLongPressFired.current = false;
       titlePressTimer.current = window.setTimeout(() => {
-        titleLongPressFired.current = true;
         setDebugOpen(true);
       }, 600);
     },
@@ -266,22 +351,17 @@ export default function App() {
     },
   };
 
-  const signalingCount = signalingStatuses.length;
-  const signalingConnected = signalingStatuses.filter((s) => s.connected).length;
-
   const debugPanel = (
     <DebugPanel
       open={debugOpen}
       onClose={() => setDebugOpen(false)}
       bundle={bundle}
       pairing={pairing}
-      signalingStatuses={signalingStatuses}
-      peerCount={peerCount}
-      bcPeerCount={bcPeerCount}
-      awarenessCount={awarenessCount}
       online={online}
-      lastSyncAt={lastSyncAt}
       lastUpdateAt={lastUpdateAt}
+      lastSentAt={lastSentAt}
+      lastReceivedAt={lastReceivedAt}
+      partnerLastUpdateAt={partnerLastUpdateAt}
       expenseCount={expenses.length}
       settlementCount={settlements.length}
     />
@@ -297,13 +377,6 @@ export default function App() {
     return (
       <>
         <PairingScreen
-          hasSignaling={hasSignaling}
-          signalingCount={signalingCount}
-          signalingConnected={signalingConnected}
-          hasPeer={peerCount > 0}
-          synced={synced}
-          bundleReady={ready}
-          pairingActive={!!pairing}
           existingPassphrase={pairing?.passphrase}
           onPersisted={onPairingPersisted}
           onIdentityChosen={onIdentityChosen}
@@ -332,6 +405,7 @@ export default function App() {
           settings={settings}
           onClose={() => setShowSettings(false)}
           onUnpair={unpair}
+          onSendToPartner={sendToPartner}
         />
         {debugPanel}
       </>
@@ -351,7 +425,8 @@ export default function App() {
         <div className="flex items-center gap-2">
           <SyncStatus
             state={syncState}
-            peerCount={peerCount}
+            lastSentAt={lastSentAt}
+            lastReceivedAt={lastReceivedAt}
             onClick={() => setDebugOpen(true)}
           />
           <button
@@ -365,16 +440,18 @@ export default function App() {
         </div>
       </header>
 
-      <BackupNudge
-        recordCount={expenses.length + settlements.length}
-        dismissedAt={backupBannerDismissedAt}
-        onDismiss={() => setBackupBannerDismissedAt(Date.now())}
-        onBackup={async () => {
-          const payload = exportSnapshot(bundle);
-          const result = await shareOrDownload(payload);
-          setToastMsg(result === 'shared' ? 'Backup shared.' : 'Backup downloaded.');
-        }}
-      />
+      {pairing && (
+        <SyncNudge
+          recordCount={recordCount}
+          lastUpdateAt={lastUpdateAt}
+          lastSentAt={lastSentAt}
+          lastReceivedAt={lastReceivedAt}
+          partnerName={partnerName}
+          dismissedAt={nudgeDismissedAt}
+          onDismiss={() => setNudgeDismissedAt(Date.now())}
+          onSend={sendToPartner}
+        />
+      )}
 
       <BalanceCard
         balance={balance}
@@ -397,6 +474,15 @@ export default function App() {
           + Add expense
         </button>
       </div>
+
+      {pairing && (
+        <button
+          className="btn-ghost border border-slate-300 dark:border-slate-700"
+          onClick={sendToPartner}
+        >
+          ↗ Send update to {partnerName}
+        </button>
+      )}
 
       <ExpenseList
         expenses={expenses}
@@ -451,6 +537,40 @@ export default function App() {
                 : undefined
             }
           />
+        )}
+      </Modal>
+
+      <Modal
+        open={pendingImport != null}
+        title={`Import update from ${partnerName}?`}
+        onClose={() => setPendingImport(null)}
+      >
+        {pendingImport && (
+          <div className="flex flex-col gap-4">
+            <p className="text-sm text-slate-600 dark:text-slate-300">
+              File: <span className="font-mono">{pendingImport.filename}</span>
+            </p>
+            <p className="text-sm text-slate-600 dark:text-slate-300">
+              The update will be merged into your local data. Existing entries are preserved; new
+              entries from your partner are added. No data is overwritten or lost.
+            </p>
+            <div className="flex gap-2">
+              <button
+                className="btn-ghost flex-1"
+                onClick={() => setPendingImport(null)}
+                disabled={importBusy}
+              >
+                Cancel
+              </button>
+              <button
+                className="btn-primary flex-1"
+                onClick={confirmPendingImport}
+                disabled={importBusy}
+              >
+                {importBusy ? 'Merging…' : 'Merge'}
+              </button>
+            </div>
+          </div>
         )}
       </Modal>
 
