@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   deriveSecrets,
   generatePassphrase,
@@ -7,6 +7,14 @@ import {
   saveStoredPairing,
   type StoredPairing,
 } from '../lib/pairing';
+import {
+  extractPassphraseFromScan,
+  isCameraScanSupported,
+  parsePairingHash,
+  renderQrToDataUrl,
+  startCameraScan,
+  type ScanHandle,
+} from '../lib/qr';
 import type { UserId } from '../lib/schema';
 
 type Mode = 'choose' | 'create-show' | 'create-wait' | 'join-enter' | 'join-progress';
@@ -89,9 +97,15 @@ export function PairingScreen(props: Props) {
   const [waitStart, setWaitStart] = useState<number | null>(null);
   const [now, setNow] = useState<number>(Date.now());
   const [showQR, setShowQR] = useState(false);
+  const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [scanError, setScanError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const scanHandleRef = useRef<ScanHandle | null>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
 
   const isWaitingMode = mode === 'create-wait' || mode === 'join-progress';
+  const cameraScanSupported = isCameraScanSupported();
 
   useEffect(() => {
     if (!isWaitingMode) {
@@ -105,6 +119,72 @@ export function PairingScreen(props: Props) {
 
   const stallMs = waitStart ? now - waitStart : 0;
   const showStallHelp = isWaitingMode && stallMs > 10000;
+
+  useEffect(() => {
+    if (mode !== 'choose') return;
+    const hash = window.location.hash;
+    const fromUrl = parsePairingHash(hash);
+    if (fromUrl && isValidPassphrase(fromUrl)) {
+      setInput(fromUrl);
+      setSelfId('B');
+      setMode('join-enter');
+      history.replaceState(null, '', window.location.pathname + window.location.search);
+    }
+  }, [mode]);
+
+  useEffect(() => {
+    if (!generated) {
+      setQrDataUrl(null);
+      return;
+    }
+    let cancelled = false;
+    renderQrToDataUrl(generated).then((url) => {
+      if (!cancelled) setQrDataUrl(url);
+    }).catch(() => {
+      if (!cancelled) setQrDataUrl(null);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [generated]);
+
+  useEffect(() => {
+    return () => {
+      scanHandleRef.current?.stop();
+      scanHandleRef.current = null;
+    };
+  }, []);
+
+  async function beginScan() {
+    if (!videoRef.current) return;
+    setScanError(null);
+    setScanning(true);
+    try {
+      const handle = await startCameraScan(
+        videoRef.current,
+        (text) => {
+          const extracted = extractPassphraseFromScan(text);
+          if (extracted && isValidPassphrase(extracted)) {
+            handle.stop();
+            scanHandleRef.current = null;
+            setScanning(false);
+            setInput(extracted);
+          }
+        },
+        (err) => setScanError(err.message),
+      );
+      scanHandleRef.current = handle;
+    } catch (e) {
+      setScanError(e instanceof Error ? e.message : String(e));
+      setScanning(false);
+    }
+  }
+
+  function stopScan() {
+    scanHandleRef.current?.stop();
+    scanHandleRef.current = null;
+    setScanning(false);
+  }
 
   const identityValid = selfLabel.trim().length > 0 && partnerLabel.trim().length > 0;
 
@@ -138,7 +218,7 @@ export function PairingScreen(props: Props) {
     try {
       const secrets = await deriveSecrets(pass);
       const stored: StoredPairing = { ...secrets, createdAt: Date.now() };
-      saveStoredPairing(stored);
+      await saveStoredPairing(stored);
       onPersisted(stored);
       setMode(nextMode);
     } catch (e) {
@@ -362,9 +442,28 @@ export function PairingScreen(props: Props) {
         <div className="card flex flex-col gap-4 p-5">
           <h2 className="text-lg font-semibold">Enter passphrase</h2>
           <p className="text-sm text-slate-600 dark:text-slate-300">
-            Type the words from your partner&rsquo;s device. Words can be separated by spaces or
-            dashes.
+            Scan the QR on your partner&rsquo;s device, or type the words. Words can be separated
+            by spaces or dashes.
           </p>
+          {cameraScanSupported && !scanning && (
+            <button className="btn-ghost border border-slate-300 dark:border-slate-700" onClick={beginScan}>
+              Scan QR code
+            </button>
+          )}
+          {scanning && (
+            <div className="flex flex-col gap-2">
+              <video
+                ref={videoRef}
+                className="w-full rounded-lg bg-slate-900"
+                muted
+                playsInline
+              />
+              <button className="btn-ghost text-sm" onClick={stopScan}>
+                Cancel scan
+              </button>
+            </div>
+          )}
+          {scanError && <p className="text-sm text-amber-700 dark:text-amber-300">{scanError}</p>}
           <textarea
             className="input min-h-[6rem] font-mono"
             placeholder="word-word-word-word-word-word"
@@ -377,7 +476,13 @@ export function PairingScreen(props: Props) {
           {identityFields}
           {error && <p className="text-sm text-red-600">{error}</p>}
           <div className="flex gap-2">
-            <button className="btn-ghost flex-1" onClick={() => setMode('choose')}>
+            <button
+              className="btn-ghost flex-1"
+              onClick={() => {
+                stopScan();
+                setMode('choose');
+              }}
+            >
               Back
             </button>
             <button
@@ -437,14 +542,33 @@ export function PairingScreen(props: Props) {
           className="fixed inset-0 z-40 flex items-center justify-center bg-black/50 p-4"
           onClick={() => setShowQR(false)}
         >
-          <div className="max-w-sm rounded-2xl bg-white p-5 shadow-xl dark:bg-slate-900">
-            <h3 className="text-base font-semibold">QR pairing</h3>
+          <div
+            className="max-w-sm rounded-2xl bg-white p-5 shadow-xl dark:bg-slate-900"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="text-base font-semibold">Scan this on your partner&rsquo;s phone</h3>
             <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
-              Coming in a later update. For now, read the words to your partner or send them via a
-              secure messenger.
+              Opens the join flow with the passphrase pre-filled. Both devices need to be on the
+              same WiFi.
+            </p>
+            <div className="mt-4 flex justify-center">
+              {qrDataUrl ? (
+                <img
+                  src={qrDataUrl}
+                  alt="Pairing QR code"
+                  className="h-64 w-64 rounded-lg bg-white"
+                />
+              ) : (
+                <div className="flex h-64 w-64 items-center justify-center text-sm text-slate-400">
+                  Rendering…
+                </div>
+              )}
+            </div>
+            <p className="mt-3 break-words text-center font-mono text-xs text-slate-500 dark:text-slate-400">
+              {generated}
             </p>
             <button className="btn-primary mt-4 w-full" onClick={() => setShowQR(false)}>
-              OK
+              Close
             </button>
           </div>
         </div>
