@@ -1,15 +1,17 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { DocBundle } from '../lib/doc';
+import { SIGNALING_SERVERS } from '../lib/doc';
 import type { Settings } from '../lib/schema';
 import { writeSettings } from '../lib/doc';
-import { clearStoredPairing, loadStoredPairing } from '../lib/pairing';
+import { clearStoredPairing, loadStoredPairing, type StoredPairing } from '../lib/pairing';
 import {
-  downloadJson,
   exportSnapshot,
   importSnapshot,
+  shareOrDownload,
   type ImportMode,
   type ExportPayload,
 } from '../lib/exportImport';
+import { wipeEverything } from '../lib/wipe';
 
 interface Props {
   bundle: DocBundle;
@@ -22,12 +24,18 @@ export function SettingsScreen({ bundle, settings, onClose, onUnpair }: Props) {
   const fileRef = useRef<HTMLInputElement>(null);
   const [importMode, setImportMode] = useState<ImportMode>('merge-yjs');
   const [message, setMessage] = useState<string | null>(null);
-  const pairing = loadStoredPairing();
+  const [pairing, setPairing] = useState<StoredPairing | null>(null);
 
-  function exportNow() {
+  useEffect(() => {
+    loadStoredPairing().then(setPairing);
+  }, []);
+
+  async function exportNow() {
     const payload = exportSnapshot(bundle);
-    downloadJson(payload);
-    setMessage(`Exported ${payload.expenses.length} expenses, ${payload.settlements.length} settlements.`);
+    const result = await shareOrDownload(payload);
+    setMessage(
+      `${result === 'shared' ? 'Shared' : 'Downloaded'} ${payload.expenses.length} expenses, ${payload.settlements.length} settlements.`,
+    );
   }
 
   function pickImport() {
@@ -71,6 +79,20 @@ export function SettingsScreen({ bundle, settings, onClose, onUnpair }: Props) {
     if (!ok) return;
     clearStoredPairing();
     onUnpair();
+  }
+
+  async function panicWipe() {
+    const ok = window.confirm(
+      'Wipe everything on this device? This deletes ALL expenses, settlements, settings, and pairing data. There is no undo. Your partner’s phone is not affected.',
+    );
+    if (!ok) return;
+    const confirm2 = window.prompt('Type WIPE to confirm.');
+    if (confirm2?.trim().toUpperCase() !== 'WIPE') {
+      setMessage('Wipe cancelled.');
+      return;
+    }
+    await wipeEverything();
+    window.location.reload();
   }
 
   return (
@@ -128,6 +150,34 @@ export function SettingsScreen({ bundle, settings, onClose, onUnpair }: Props) {
             onChange={onFile}
           />
         </div>
+        <p className="text-xs text-slate-500 dark:text-slate-400">
+          The export format is documented at{' '}
+          <a
+            href="https://github.com/phonepvr/spendtrack/blob/main/docs/SCHEMA.md"
+            target="_blank"
+            rel="noreferrer"
+            className="underline"
+          >
+            docs/SCHEMA.md
+          </a>{' '}
+          so you can recover your data without the app.
+        </p>
+      </section>
+
+      <section className="card flex flex-col gap-2 p-4">
+        <h2 className="font-semibold">What this app shares</h2>
+        <p className="text-sm text-slate-600 dark:text-slate-300">
+          Signaling servers help your two phones find each other. They see a derived room ID and
+          your IP address. They never see your passphrase or any expense data — those are
+          end-to-end encrypted using a key derived from your passphrase.
+        </p>
+        <ul className="mt-1 list-disc pl-5 text-xs text-slate-500 dark:text-slate-400">
+          {SIGNALING_SERVERS.map((url) => (
+            <li key={url} className="font-mono">
+              {url}
+            </li>
+          ))}
+        </ul>
       </section>
 
       <section className="card flex flex-col gap-3 p-4">
@@ -153,6 +203,22 @@ export function SettingsScreen({ bundle, settings, onClose, onUnpair }: Props) {
           </p>
         )}
       </section>
+
+      <section className="card flex flex-col gap-3 border-red-200 p-4 dark:border-red-900/50">
+        <h2 className="font-semibold text-red-700 dark:text-red-300">Danger zone</h2>
+        <p className="text-sm text-slate-600 dark:text-slate-300">
+          Wipe all data on this device — expenses, settlements, pairing, and the offline app
+          cache. Useful if you&rsquo;re lending or selling this phone. Your partner&rsquo;s phone
+          is unaffected.
+        </p>
+        <button className="btn-danger" onClick={panicWipe}>
+          Wipe this device
+        </button>
+      </section>
+
+      <footer className="pt-2 text-center text-[11px] text-slate-400 dark:text-slate-600">
+        Build {__BUILD_HASH__} · {new Date(__BUILD_TIME__).toLocaleDateString()}
+      </footer>
 
       {message && (
         <div className="rounded-lg bg-emerald-50 p-3 text-sm text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-200">

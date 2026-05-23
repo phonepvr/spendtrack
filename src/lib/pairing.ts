@@ -105,7 +105,11 @@ export async function deriveSecrets(passphraseInput: string): Promise<PairingSec
   };
 }
 
-const STORAGE_KEY = 'spendtrack/pairing/v1';
+const STORAGE_KEY = 'spendtrack/pairing/v2';
+const LEGACY_STORAGE_KEY = 'spendtrack/pairing/v1';
+const KEYSTORE_DB = 'spendtrack-keystore';
+const KEYSTORE_STORE = 'keys';
+const KEY_ID = 'pairing-aes-v1';
 
 export interface StoredPairing {
   passphrase: string;
@@ -115,20 +119,110 @@ export interface StoredPairing {
   createdAt: number;
 }
 
-export function loadStoredPairing(): StoredPairing | null {
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+function base64ToBytes(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function openKeyStore(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(KEYSTORE_DB, 1);
+    req.onupgradeneeded = () => {
+      req.result.createObjectStore(KEYSTORE_STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function getOrCreateWrappingKey(): Promise<CryptoKey> {
+  const db = await openKeyStore();
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return null;
-    return JSON.parse(raw) as StoredPairing;
+    const existing = await new Promise<CryptoKey | undefined>((resolve, reject) => {
+      const tx = db.transaction(KEYSTORE_STORE, 'readonly');
+      const req = tx.objectStore(KEYSTORE_STORE).get(KEY_ID);
+      req.onsuccess = () => resolve(req.result as CryptoKey | undefined);
+      req.onerror = () => reject(req.error);
+    });
+    if (existing) return existing;
+    const key = await crypto.subtle.generateKey(
+      { name: 'AES-GCM', length: 256 },
+      false,
+      ['encrypt', 'decrypt'],
+    );
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(KEYSTORE_STORE, 'readwrite');
+      tx.objectStore(KEYSTORE_STORE).put(key, KEY_ID);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+    return key;
+  } finally {
+    db.close();
+  }
+}
+
+async function encryptBlob(plain: string): Promise<string> {
+  const key = await getOrCreateWrappingKey();
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const cipher = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    key,
+    new TextEncoder().encode(plain),
+  );
+  const combined = new Uint8Array(iv.byteLength + cipher.byteLength);
+  combined.set(iv, 0);
+  combined.set(new Uint8Array(cipher), iv.byteLength);
+  return bytesToBase64(combined);
+}
+
+async function decryptBlob(b64: string): Promise<string> {
+  const key = await getOrCreateWrappingKey();
+  const data = base64ToBytes(b64);
+  const iv = data.slice(0, 12);
+  const cipher = data.slice(12);
+  const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, cipher);
+  return new TextDecoder().decode(plain);
+}
+
+export async function loadStoredPairing(): Promise<StoredPairing | null> {
+  try {
+    const ciphertext = localStorage.getItem(STORAGE_KEY);
+    if (ciphertext) {
+      const plain = await decryptBlob(ciphertext);
+      return JSON.parse(plain) as StoredPairing;
+    }
+    const legacy = localStorage.getItem(LEGACY_STORAGE_KEY);
+    if (legacy) {
+      const parsed = JSON.parse(legacy) as StoredPairing;
+      try {
+        await saveStoredPairing(parsed);
+        localStorage.removeItem(LEGACY_STORAGE_KEY);
+      } catch {
+        /* migration best-effort; keep legacy as fallback */
+      }
+      return parsed;
+    }
+    return null;
   } catch {
     return null;
   }
 }
 
-export function saveStoredPairing(p: StoredPairing): void {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(p));
+export async function saveStoredPairing(p: StoredPairing): Promise<void> {
+  const ciphertext = await encryptBlob(JSON.stringify(p));
+  localStorage.setItem(STORAGE_KEY, ciphertext);
 }
 
 export function clearStoredPairing(): void {
   localStorage.removeItem(STORAGE_KEY);
+  localStorage.removeItem(LEGACY_STORAGE_KEY);
 }

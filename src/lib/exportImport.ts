@@ -43,17 +43,68 @@ export function exportSnapshot(bundle: DocBundle): ExportPayload {
   };
 }
 
+function buildExportFile(payload: ExportPayload): { file: File; filename: string } {
+  const stamp = new Date(payload.exportedAt).toISOString().replace(/[:.]/g, '-');
+  const filename = `spendtrack-${stamp}.json`;
+  const file = new File([JSON.stringify(payload, null, 2)], filename, {
+    type: 'application/json',
+  });
+  return { file, filename };
+}
+
 export function downloadJson(payload: ExportPayload): void {
-  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
+  const { file, filename } = buildExportFile(payload);
+  const url = URL.createObjectURL(file);
   const a = document.createElement('a');
   a.href = url;
-  const stamp = new Date(payload.exportedAt).toISOString().replace(/[:.]/g, '-');
-  a.download = `spendtrack-${stamp}.json`;
+  a.download = filename;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+  markExportSucceeded(payload.exportedAt);
+}
+
+export async function shareOrDownload(payload: ExportPayload): Promise<'shared' | 'downloaded'> {
+  const { file, filename } = buildExportFile(payload);
+  const navAny = navigator as Navigator & {
+    canShare?: (data: { files?: File[] }) => boolean;
+    share?: (data: { files?: File[]; title?: string; text?: string }) => Promise<void>;
+  };
+  if (navAny.share && navAny.canShare?.({ files: [file] })) {
+    try {
+      await navAny.share({
+        files: [file],
+        title: 'Spendtrack backup',
+        text: `Spendtrack backup ${filename}`,
+      });
+      markExportSucceeded(payload.exportedAt);
+      return 'shared';
+    } catch (e) {
+      if (e instanceof Error && e.name === 'AbortError') {
+        return 'downloaded';
+      }
+    }
+  }
+  downloadJson(payload);
+  return 'downloaded';
+}
+
+const LAST_EXPORT_KEY = 'spendtrack/lastExportAt/v1';
+
+export function getLastExportAt(): number | null {
+  const raw = localStorage.getItem(LAST_EXPORT_KEY);
+  if (!raw) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+function markExportSucceeded(ms: number): void {
+  try {
+    localStorage.setItem(LAST_EXPORT_KEY, String(ms));
+  } catch {
+    /* ignore */
+  }
 }
 
 export type ImportMode = 'merge-yjs' | 'merge-records' | 'replace';

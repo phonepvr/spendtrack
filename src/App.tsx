@@ -18,6 +18,11 @@ import {
   writeSettings,
   writeSettlement,
 } from './lib/doc';
+import {
+  exportSnapshot,
+  getLastExportAt,
+  shareOrDownload,
+} from './lib/exportImport';
 import { loadStoredPairing, type StoredPairing } from './lib/pairing';
 import { partner, type Expense, type Settlement, type UserId } from './lib/schema';
 
@@ -40,14 +45,74 @@ function urlHasDebug(): boolean {
   }
 }
 
+const BACKUP_NUDGE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
+const BACKUP_NUDGE_DISMISS_MS = 24 * 60 * 60 * 1000;
+
+interface BackupNudgeProps {
+  recordCount: number;
+  dismissedAt: number | null;
+  onDismiss: () => void;
+  onBackup: () => void;
+}
+
+function BackupNudge({ recordCount, dismissedAt, onDismiss, onBackup }: BackupNudgeProps) {
+  const lastExport = getLastExportAt();
+  const now = Date.now();
+  if (recordCount === 0) return null;
+  if (dismissedAt && now - dismissedAt < BACKUP_NUDGE_DISMISS_MS) return null;
+  if (lastExport && now - lastExport < BACKUP_NUDGE_AFTER_MS) return null;
+  const daysSince = lastExport ? Math.floor((now - lastExport) / 86_400_000) : null;
+  return (
+    <div className="flex items-start gap-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm dark:border-amber-900/50 dark:bg-amber-900/20">
+      <div className="flex-1">
+        <div className="font-medium text-amber-900 dark:text-amber-200">Back up your data</div>
+        <div className="text-xs text-amber-800 dark:text-amber-300">
+          {daysSince == null
+            ? 'You haven’t exported a backup yet.'
+            : `Last backup was ${daysSince} day${daysSince === 1 ? '' : 's'} ago.`}
+        </div>
+      </div>
+      <button
+        type="button"
+        className="btn-primary px-3 py-1 text-xs"
+        onClick={onBackup}
+      >
+        Back up
+      </button>
+      <button
+        type="button"
+        className="text-xs text-amber-700 underline-offset-2 hover:underline dark:text-amber-300"
+        onClick={onDismiss}
+        aria-label="Dismiss"
+      >
+        Later
+      </button>
+    </div>
+  );
+}
+
 export default function App() {
-  const [pairing, setPairing] = useState<StoredPairing | null>(() => loadStoredPairing());
+  const [pairing, setPairing] = useState<StoredPairing | null>(null);
+  const [pairingLoaded, setPairingLoaded] = useState(false);
   const [skippedPairing, setSkippedPairing] = useState(false);
   const [pendingIdentity, setPendingIdentity] = useState<PendingIdentity | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [debugOpen, setDebugOpen] = useState(() => urlHasDebug());
   const [sheet, setSheet] = useState<Sheet>({ kind: 'none' });
   const [toastMsg, setToastMsg] = useState<string | null>(null);
+  const [backupBannerDismissedAt, setBackupBannerDismissedAt] = useState<number | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    loadStoredPairing().then((p) => {
+      if (cancelled) return;
+      setPairing(p);
+      setPairingLoaded(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const docState = useDoc(pairing);
   const {
@@ -68,7 +133,7 @@ export default function App() {
   } = docState;
 
   const synced = lastSyncAt != null && peerCount > 0;
-  const showPairing = !settings.paired && !skippedPairing;
+  const showPairing = pairingLoaded && !settings.paired && !skippedPairing;
 
   useEffect(() => {
     if (!ready || !bundle || !pendingIdentity) return;
@@ -222,6 +287,12 @@ export default function App() {
     />
   );
 
+  if (!pairingLoaded) {
+    return (
+      <div className="flex min-h-full items-center justify-center text-slate-500">Loading…</div>
+    );
+  }
+
   if (showPairing) {
     return (
       <>
@@ -293,6 +364,17 @@ export default function App() {
           </button>
         </div>
       </header>
+
+      <BackupNudge
+        recordCount={expenses.length + settlements.length}
+        dismissedAt={backupBannerDismissedAt}
+        onDismiss={() => setBackupBannerDismissedAt(Date.now())}
+        onBackup={async () => {
+          const payload = exportSnapshot(bundle);
+          const result = await shareOrDownload(payload);
+          setToastMsg(result === 'shared' ? 'Backup shared.' : 'Backup downloaded.');
+        }}
+      />
 
       <BalanceCard
         balance={balance}
@@ -371,6 +453,10 @@ export default function App() {
           />
         )}
       </Modal>
+
+      <footer className="mt-auto pt-4 text-center text-[10px] text-slate-400 dark:text-slate-600">
+        Build {__BUILD_HASH__}
+      </footer>
 
       <Toast message={toastMsg} onDismiss={() => setToastMsg(null)} />
       {debugPanel}
