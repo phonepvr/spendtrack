@@ -2,20 +2,17 @@ import { useEffect, useMemo, useState } from 'react';
 import * as Y from 'yjs';
 import type { DocBundle } from '../lib/doc';
 import type { StoredPairing } from '../lib/pairing';
-import type { SignalingStatus } from '../hooks/useDoc';
 
 interface Props {
   open: boolean;
   onClose: () => void;
   bundle: DocBundle | null;
   pairing: StoredPairing | null;
-  signalingStatuses: SignalingStatus[];
-  peerCount: number;
-  bcPeerCount: number;
-  awarenessCount: number;
   online: boolean;
-  lastSyncAt: number | null;
   lastUpdateAt: number | null;
+  lastSentAt: number | null;
+  lastReceivedAt: number | null;
+  partnerLastUpdateAt: number | null;
   expenseCount: number;
   settlementCount: number;
 }
@@ -54,13 +51,11 @@ export function DebugPanel(props: Props) {
     onClose,
     bundle,
     pairing,
-    signalingStatuses,
-    peerCount,
-    bcPeerCount,
-    awarenessCount,
     online,
-    lastSyncAt,
     lastUpdateAt,
+    lastSentAt,
+    lastReceivedAt,
+    partnerLastUpdateAt,
     expenseCount,
     settlementCount,
   } = props;
@@ -98,7 +93,6 @@ export function DebugPanel(props: Props) {
   const lines = useMemo(() => {
     const ua = navigator.userAgent.slice(0, 80);
     const clientId = bundle?.doc.clientID ?? 'n/a';
-    const provider = bundle?.webrtc ?? null;
     const out: string[] = [];
     out.push('SPENDTRACK DEBUG');
     out.push(`Captured at:   ${new Date(now).toISOString()}`);
@@ -111,8 +105,7 @@ export function DebugPanel(props: Props) {
     out.push('PAIRING');
     if (pairing) {
       out.push(`Passphrase hex: ${passphraseHex.slice(0, 16) || '(computing...)'}`);
-      out.push(`Room ID:        ${pairing.roomId.slice(0, 24)}`);
-      out.push(`Password:       ${pairing.webrtcPassword.slice(0, 8)}`);
+      out.push(`Pairing hint:   ${pairing.pairingHint ?? '(n/a)'}`);
       out.push(`Doc name:       ${pairing.docName}`);
       out.push(`Normalized:     ${pairing.passphrase}`);
       out.push(`Created at:     ${new Date(pairing.createdAt).toISOString()}`);
@@ -127,40 +120,21 @@ export function DebugPanel(props: Props) {
     out.push(`Settlements:    ${settlementCount}`);
     out.push(`Last update at: ${formatTime(lastUpdateAt)}`);
     out.push('');
-    out.push('WEBRTC');
-    out.push(`Provider:       ${provider ? 'present' : 'absent'}`);
-    if (provider) {
-      const room = provider.room;
-      out.push(`Room:           ${room ? 'present' : 'absent'}`);
-      out.push(`WebRTC peers:   ${peerCount}`);
-      out.push(`BC peers:       ${bcPeerCount}`);
-      out.push(`Awareness:      ${awarenessCount}`);
-      out.push(`Last sync at:   ${formatTime(lastSyncAt)}`);
-    }
-    out.push('');
-    out.push(`SIGNALING (${signalingStatuses.length} URLs)`);
-    if (signalingStatuses.length === 0) {
-      out.push('  (no signaling connections)');
-    } else {
-      for (const s of signalingStatuses) {
-        out.push(
-          `  ${s.connected ? 'CONNECTED' : '  CLOSED '}  ${s.url}  last-event ${formatTime(s.lastEventAt)}`,
-        );
-      }
-    }
+    out.push('SYNC');
+    out.push(`Last sent:      ${formatTime(lastSentAt)}`);
+    out.push(`Last received:  ${formatTime(lastReceivedAt)}`);
+    out.push(`Partner update: ${formatTime(partnerLastUpdateAt)}`);
     return out;
   }, [
     bundle,
     pairing,
     passphraseHex,
     stateVectorHex,
-    peerCount,
-    bcPeerCount,
-    awarenessCount,
     online,
-    lastSyncAt,
     lastUpdateAt,
-    signalingStatuses,
+    lastSentAt,
+    lastReceivedAt,
+    partnerLastUpdateAt,
     expenseCount,
     settlementCount,
     now,

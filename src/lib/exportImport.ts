@@ -7,6 +7,7 @@ import {
   writeSettlement,
 } from './doc';
 import type { DocBundle } from './doc';
+import { deriveFileKey, derivePairingHint } from './pairing';
 import type { Expense, Settlement } from './schema';
 
 export interface ExportPayload {
@@ -15,6 +16,16 @@ export interface ExportPayload {
   expenses: Expense[];
   settlements: Settlement[];
   yjsUpdate: string;
+  sourceId?: 'A' | 'B';
+}
+
+export interface ExportEnvelope {
+  format: 'spendtrack/v1/encrypted';
+  iv: string;
+  ciphertext: string;
+  pairingHint: string;
+  exportedAt: number;
+  sourceId?: 'A' | 'B';
 }
 
 function bytesToBase64(bytes: Uint8Array): string {
@@ -30,7 +41,7 @@ function base64ToBytes(b64: string): Uint8Array {
   return out;
 }
 
-export function exportSnapshot(bundle: DocBundle): ExportPayload {
+export function exportSnapshot(bundle: DocBundle, sourceId?: 'A' | 'B'): ExportPayload {
   const expenses = bundle.expenses.toArray().map(readExpense);
   const settlements = bundle.settlements.toArray().map(readSettlement);
   const update = Y.encodeStateAsUpdate(bundle.doc);
@@ -40,10 +51,72 @@ export function exportSnapshot(bundle: DocBundle): ExportPayload {
     expenses,
     settlements,
     yjsUpdate: bytesToBase64(update),
+    sourceId,
   };
 }
 
-function buildExportFile(payload: ExportPayload): { file: File; filename: string } {
+export async function encryptEnvelope(
+  payload: ExportPayload,
+  passphrase: string,
+): Promise<ExportEnvelope> {
+  const key = await deriveFileKey(passphrase);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plaintext = new TextEncoder().encode(JSON.stringify(payload));
+  const cipher = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plaintext);
+  const hint = await derivePairingHint(passphrase);
+  return {
+    format: 'spendtrack/v1/encrypted',
+    iv: bytesToBase64(iv),
+    ciphertext: bytesToBase64(new Uint8Array(cipher)),
+    pairingHint: hint,
+    exportedAt: payload.exportedAt,
+    sourceId: payload.sourceId,
+  };
+}
+
+export class WrongPairingError extends Error {
+  constructor() {
+    super('This file isn’t from your pairing partner.');
+    this.name = 'WrongPairingError';
+  }
+}
+
+export class DecryptError extends Error {
+  constructor() {
+    super('Could not decrypt this file. The passphrase may have changed.');
+    this.name = 'DecryptError';
+  }
+}
+
+export async function decryptEnvelope(
+  envelope: ExportEnvelope,
+  passphrase: string,
+): Promise<ExportPayload> {
+  const expectedHint = await derivePairingHint(passphrase);
+  if (envelope.pairingHint !== expectedHint) {
+    throw new WrongPairingError();
+  }
+  const key = await deriveFileKey(passphrase);
+  try {
+    const iv = base64ToBytes(envelope.iv).slice();
+    const cipher = base64ToBytes(envelope.ciphertext).slice();
+    const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, cipher);
+    return JSON.parse(new TextDecoder().decode(plain)) as ExportPayload;
+  } catch {
+    throw new DecryptError();
+  }
+}
+
+function buildEnvelopeFile(envelope: ExportEnvelope): { file: File; filename: string } {
+  const stamp = new Date(envelope.exportedAt).toISOString().replace(/[:.]/g, '-');
+  const filename = `spendtrack-${stamp}.spendtrack`;
+  const file = new File([JSON.stringify(envelope)], filename, {
+    type: 'application/spendtrack+json',
+  });
+  return { file, filename };
+}
+
+function buildLegacyExportFile(payload: ExportPayload): { file: File; filename: string } {
   const stamp = new Date(payload.exportedAt).toISOString().replace(/[:.]/g, '-');
   const filename = `spendtrack-${stamp}.json`;
   const file = new File([JSON.stringify(payload, null, 2)], filename, {
@@ -53,7 +126,48 @@ function buildExportFile(payload: ExportPayload): { file: File; filename: string
 }
 
 export function downloadJson(payload: ExportPayload): void {
-  const { file, filename } = buildExportFile(payload);
+  const { file, filename } = buildLegacyExportFile(payload);
+  triggerDownload(file, filename);
+  markExportSucceeded(payload.exportedAt);
+}
+
+export async function shareSyncFile(
+  payload: ExportPayload,
+  passphrase: string,
+  partnerName: string,
+): Promise<'shared' | 'downloaded'> {
+  const envelope = await encryptEnvelope(payload, passphrase);
+  const { file, filename } = buildEnvelopeFile(envelope);
+  const result = await shareFile(file, filename, {
+    title: 'Spendtrack sync',
+    text: `Spendtrack update — open this in ${partnerName}’s app to sync.`,
+  });
+  markSent(payload.exportedAt);
+  return result;
+}
+
+async function shareFile(
+  file: File,
+  filename: string,
+  meta: { title: string; text: string },
+): Promise<'shared' | 'downloaded'> {
+  const navAny = navigator as Navigator & {
+    canShare?: (data: { files?: File[] }) => boolean;
+    share?: (data: { files?: File[]; title?: string; text?: string }) => Promise<void>;
+  };
+  if (navAny.share && navAny.canShare?.({ files: [file] })) {
+    try {
+      await navAny.share({ files: [file], title: meta.title, text: meta.text });
+      return 'shared';
+    } catch (e) {
+      if (e instanceof Error && e.name === 'AbortError') return 'downloaded';
+    }
+  }
+  triggerDownload(file, filename);
+  return 'downloaded';
+}
+
+function triggerDownload(file: File, filename: string): void {
   const url = URL.createObjectURL(file);
   const a = document.createElement('a');
   a.href = url;
@@ -62,49 +176,55 @@ export function downloadJson(payload: ExportPayload): void {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
-  markExportSucceeded(payload.exportedAt);
-}
-
-export async function shareOrDownload(payload: ExportPayload): Promise<'shared' | 'downloaded'> {
-  const { file, filename } = buildExportFile(payload);
-  const navAny = navigator as Navigator & {
-    canShare?: (data: { files?: File[] }) => boolean;
-    share?: (data: { files?: File[]; title?: string; text?: string }) => Promise<void>;
-  };
-  if (navAny.share && navAny.canShare?.({ files: [file] })) {
-    try {
-      await navAny.share({
-        files: [file],
-        title: 'Spendtrack backup',
-        text: `Spendtrack backup ${filename}`,
-      });
-      markExportSucceeded(payload.exportedAt);
-      return 'shared';
-    } catch (e) {
-      if (e instanceof Error && e.name === 'AbortError') {
-        return 'downloaded';
-      }
-    }
-  }
-  downloadJson(payload);
-  return 'downloaded';
 }
 
 const LAST_EXPORT_KEY = 'spendtrack/lastExportAt/v1';
+const LAST_SENT_KEY = 'spendtrack/lastSentAt/v1';
+const LAST_RECEIVED_KEY = 'spendtrack/lastReceivedAt/v1';
+const PARTNER_LAST_UPDATE_KEY = 'spendtrack/partnerLastUpdateAt/v1';
 
-export function getLastExportAt(): number | null {
-  const raw = localStorage.getItem(LAST_EXPORT_KEY);
+function readNumber(key: string): number | null {
+  const raw = localStorage.getItem(key);
   if (!raw) return null;
   const n = Number(raw);
   return Number.isFinite(n) ? n : null;
 }
 
-function markExportSucceeded(ms: number): void {
+function writeNumber(key: string, value: number): void {
   try {
-    localStorage.setItem(LAST_EXPORT_KEY, String(ms));
+    localStorage.setItem(key, String(value));
   } catch {
     /* ignore */
   }
+}
+
+export function getLastExportAt(): number | null {
+  return readNumber(LAST_EXPORT_KEY);
+}
+
+function markExportSucceeded(ms: number): void {
+  writeNumber(LAST_EXPORT_KEY, ms);
+}
+
+export function getLastSentAt(): number | null {
+  return readNumber(LAST_SENT_KEY);
+}
+
+export function getLastReceivedAt(): number | null {
+  return readNumber(LAST_RECEIVED_KEY);
+}
+
+export function getPartnerLastUpdateAt(): number | null {
+  return readNumber(PARTNER_LAST_UPDATE_KEY);
+}
+
+function markSent(ms: number): void {
+  writeNumber(LAST_SENT_KEY, ms);
+}
+
+function markReceived(ms: number, partnerLastUpdateAt: number): void {
+  writeNumber(LAST_RECEIVED_KEY, ms);
+  writeNumber(PARTNER_LAST_UPDATE_KEY, partnerLastUpdateAt);
 }
 
 export type ImportMode = 'merge-yjs' | 'merge-records' | 'replace';
@@ -113,6 +233,53 @@ export interface ImportResult {
   added: number;
   updated: number;
   total: number;
+}
+
+export function isEnvelope(obj: unknown): obj is ExportEnvelope {
+  return (
+    typeof obj === 'object' &&
+    obj !== null &&
+    (obj as { format?: unknown }).format === 'spendtrack/v1/encrypted'
+  );
+}
+
+export function isExportPayload(obj: unknown): obj is ExportPayload {
+  return (
+    typeof obj === 'object' &&
+    obj !== null &&
+    (obj as { format?: unknown }).format === 'spendtrack/v1'
+  );
+}
+
+export async function importFile(
+  bundle: DocBundle,
+  raw: string,
+  passphrase: string | null,
+  mode: ImportMode = 'merge-yjs',
+): Promise<ImportResult & { sourceId?: 'A' | 'B' }> {
+  const parsed = JSON.parse(raw) as unknown;
+  let payload: ExportPayload;
+  let viaEnvelope = false;
+  if (isEnvelope(parsed)) {
+    if (!passphrase) throw new WrongPairingError();
+    payload = await decryptEnvelope(parsed, passphrase);
+    viaEnvelope = true;
+  } else if (isExportPayload(parsed)) {
+    payload = parsed;
+  } else {
+    throw new Error('Unknown file format.');
+  }
+
+  const before = bundle.expenses.length + bundle.settlements.length;
+  const result = importSnapshot(bundle, payload, mode);
+  const after = bundle.expenses.length + bundle.settlements.length;
+  const merged = mode === 'merge-yjs' ? { added: after - before, updated: 0, total: after } : result;
+
+  if (viaEnvelope) {
+    markReceived(Date.now(), payload.exportedAt);
+  }
+
+  return { ...merged, sourceId: payload.sourceId };
 }
 
 export function importSnapshot(

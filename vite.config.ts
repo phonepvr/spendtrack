@@ -33,6 +33,28 @@ export default defineConfig({
           { src: 'icon-512.png', sizes: '512x512', type: 'image/png' },
           { src: 'icon-512-maskable.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
         ],
+        file_handlers: [
+          {
+            action: '/spendtrack/',
+            accept: {
+              'application/spendtrack+json': ['.spendtrack'],
+              'application/json': ['.json'],
+            },
+          },
+        ],
+        share_target: {
+          action: '/spendtrack/',
+          method: 'POST',
+          enctype: 'multipart/form-data',
+          params: {
+            files: [
+              {
+                name: 'sync_file',
+                accept: ['application/spendtrack+json', '.spendtrack', 'application/json'],
+              },
+            ],
+          },
+        },
       },
       workbox: {
         globPatterns: ['**/*.{js,css,html,svg,png,ico,webmanifest}'],

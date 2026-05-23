@@ -56,6 +56,8 @@ export function isValidPassphrase(input: string): boolean {
 const SALT_ROOM = 'spendtrack/v1/room';
 const SALT_PASSWORD = 'spendtrack/v1/password';
 const SALT_DOC = 'spendtrack/v1/doc';
+const SALT_FILE = 'spendtrack/v1/file';
+const SALT_HINT = 'spendtrack/v1/hint';
 
 async function hkdf(passphrase: string, salt: string, length: number): Promise<Uint8Array> {
   const enc = new TextEncoder();
@@ -83,25 +85,52 @@ function toHex(bytes: Uint8Array): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+function bytesToBase64Url(bytes: Uint8Array): string {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+export async function derivePairingHint(passphraseInput: string): Promise<string> {
+  const passphrase = normalizePassphrase(passphraseInput);
+  const bytes = await hkdf(passphrase, SALT_HINT, 4);
+  return bytesToBase64Url(bytes);
+}
+
+export async function deriveFileKey(passphraseInput: string): Promise<CryptoKey> {
+  const passphrase = normalizePassphrase(passphraseInput);
+  const raw = await hkdf(passphrase, SALT_FILE, 32);
+  return crypto.subtle.importKey(
+    'raw',
+    raw.slice(),
+    { name: 'AES-GCM' },
+    false,
+    ['encrypt', 'decrypt'],
+  );
+}
+
 export interface PairingSecrets {
   passphrase: string;
   roomId: string;
   webrtcPassword: string;
   docName: string;
+  pairingHint: string;
 }
 
 export async function deriveSecrets(passphraseInput: string): Promise<PairingSecrets> {
   const passphrase = normalizePassphrase(passphraseInput);
-  const [roomBytes, passwordBytes, docBytes] = await Promise.all([
+  const [roomBytes, passwordBytes, docBytes, hintBytes] = await Promise.all([
     hkdf(passphrase, SALT_ROOM, 16),
     hkdf(passphrase, SALT_PASSWORD, 32),
     hkdf(passphrase, SALT_DOC, 8),
+    hkdf(passphrase, SALT_HINT, 4),
   ]);
   return {
     passphrase,
     roomId: 'spendtrack-' + toHex(roomBytes),
     webrtcPassword: toHex(passwordBytes),
     docName: 'spendtrack-doc-' + toHex(docBytes),
+    pairingHint: bytesToBase64Url(hintBytes),
   };
 }
 
@@ -116,6 +145,7 @@ export interface StoredPairing {
   roomId: string;
   webrtcPassword: string;
   docName: string;
+  pairingHint: string;
   createdAt: number;
 }
 
@@ -193,16 +223,23 @@ async function decryptBlob(b64: string): Promise<string> {
   return new TextDecoder().decode(plain);
 }
 
+async function backfill(p: StoredPairing): Promise<StoredPairing> {
+  if (p.pairingHint) return p;
+  const hint = await derivePairingHint(p.passphrase);
+  return { ...p, pairingHint: hint };
+}
+
 export async function loadStoredPairing(): Promise<StoredPairing | null> {
   try {
     const ciphertext = localStorage.getItem(STORAGE_KEY);
     if (ciphertext) {
       const plain = await decryptBlob(ciphertext);
-      return JSON.parse(plain) as StoredPairing;
+      const filled = await backfill(JSON.parse(plain) as StoredPairing);
+      return filled;
     }
     const legacy = localStorage.getItem(LEGACY_STORAGE_KEY);
     if (legacy) {
-      const parsed = JSON.parse(legacy) as StoredPairing;
+      const parsed = await backfill(JSON.parse(legacy) as StoredPairing);
       try {
         await saveStoredPairing(parsed);
         localStorage.removeItem(LEGACY_STORAGE_KEY);

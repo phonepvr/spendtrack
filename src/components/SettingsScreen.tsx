@@ -1,16 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
 import type { DocBundle } from '../lib/doc';
-import { SIGNALING_SERVERS } from '../lib/doc';
 import type { Settings } from '../lib/schema';
 import { writeSettings } from '../lib/doc';
 import { clearStoredPairing, loadStoredPairing, type StoredPairing } from '../lib/pairing';
 import {
   exportSnapshot,
-  importSnapshot,
-  shareOrDownload,
-  type ImportMode,
-  type ExportPayload,
+  importFile,
+  WrongPairingError,
 } from '../lib/exportImport';
+import { partner } from '../lib/schema';
 import { wipeEverything } from '../lib/wipe';
 
 interface Props {
@@ -18,11 +16,17 @@ interface Props {
   settings: Settings;
   onClose: () => void;
   onUnpair: () => void;
+  onSendToPartner: () => Promise<void>;
 }
 
-export function SettingsScreen({ bundle, settings, onClose, onUnpair }: Props) {
+export function SettingsScreen({
+  bundle,
+  settings,
+  onClose,
+  onUnpair,
+  onSendToPartner,
+}: Props) {
   const fileRef = useRef<HTMLInputElement>(null);
-  const [importMode, setImportMode] = useState<ImportMode>('merge-yjs');
   const [message, setMessage] = useState<string | null>(null);
   const [pairing, setPairing] = useState<StoredPairing | null>(null);
 
@@ -30,11 +34,22 @@ export function SettingsScreen({ bundle, settings, onClose, onUnpair }: Props) {
     loadStoredPairing().then(setPairing);
   }, []);
 
-  async function exportNow() {
-    const payload = exportSnapshot(bundle);
-    const result = await shareOrDownload(payload);
+  const partnerName = settings.labels[partner(settings.selfId)] || 'partner';
+
+  function downloadPlainJson() {
+    const payload = exportSnapshot(bundle, settings.selfId);
+    const stamp = new Date(payload.exportedAt).toISOString().replace(/[:.]/g, '-');
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `spendtrack-${stamp}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
     setMessage(
-      `${result === 'shared' ? 'Shared' : 'Downloaded'} ${payload.expenses.length} expenses, ${payload.settlements.length} settlements.`,
+      `Downloaded plain JSON with ${payload.expenses.length} expenses, ${payload.settlements.length} settlements. This file is unencrypted — keep it safe.`,
     );
   }
 
@@ -46,17 +61,25 @@ export function SettingsScreen({ bundle, settings, onClose, onUnpair }: Props) {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = () => {
+    reader.onload = async () => {
       try {
-        const payload = JSON.parse(String(reader.result)) as ExportPayload;
-        const result = importSnapshot(bundle, payload, importMode);
+        const result = await importFile(
+          bundle,
+          String(reader.result),
+          pairing?.passphrase ?? null,
+          'merge-yjs',
+        );
         setMessage(
-          importMode === 'merge-yjs'
-            ? `Merged Yjs state. Total entries now: ${result.total}.`
-            : `${importMode === 'replace' ? 'Replaced' : 'Merged records'} — added ${result.added}, updated ${result.updated}.`,
+          result.added > 0
+            ? `Merged ${result.added} new entr${result.added === 1 ? 'y' : 'ies'}. Total now: ${result.total}.`
+            : `Already in sync. Total entries: ${result.total}.`,
         );
       } catch (err) {
-        setMessage('Import failed: ' + (err instanceof Error ? err.message : String(err)));
+        if (err instanceof WrongPairingError) {
+          setMessage('This file isn’t from your pairing partner.');
+        } else {
+          setMessage('Import failed: ' + (err instanceof Error ? err.message : String(err)));
+        }
       } finally {
         if (fileRef.current) fileRef.current.value = '';
       }
@@ -74,7 +97,7 @@ export function SettingsScreen({ bundle, settings, onClose, onUnpair }: Props) {
 
   function unpair() {
     const ok = window.confirm(
-      'Unpair this device? Your local data stays on this phone, but you will need the passphrase again to resume sync.',
+      'Unpair this device? Your local data stays on this phone, but you will need the passphrase again to decrypt files from your partner.',
     );
     if (!ok) return;
     clearStoredPairing();
@@ -119,39 +142,51 @@ export function SettingsScreen({ bundle, settings, onClose, onUnpair }: Props) {
           onChange={(e) => updateLabel('B', e.target.value)}
         />
         <p className="text-xs text-slate-500 dark:text-slate-400">
-          Names sync to your partner&rsquo;s phone via Yjs.
+          Names sync to your partner&rsquo;s phone when they import an update from you.
         </p>
       </section>
 
-      <section className="card flex flex-col gap-3 p-4">
-        <h2 className="font-semibold">Backup &amp; restore</h2>
-        <button className="btn-primary" onClick={exportNow}>
-          Export JSON backup
-        </button>
-        <div className="flex flex-col gap-2">
-          <label className="label">Import strategy</label>
-          <select
-            className="input"
-            value={importMode}
-            onChange={(e) => setImportMode(e.target.value as ImportMode)}
+      {pairing && (
+        <section className="card flex flex-col gap-3 p-4">
+          <h2 className="font-semibold">Sync with {partnerName}</h2>
+          <p className="text-sm text-slate-600 dark:text-slate-300">
+            Sends an encrypted file via your share sheet (WhatsApp, AirDrop, email, anything).
+            Your partner taps the file to merge it into their app — duplicates and lost edits are
+            impossible thanks to CRDT merge.
+          </p>
+          <button className="btn-primary" onClick={onSendToPartner}>
+            ↗ Send update to {partnerName}
+          </button>
+          <button
+            className="btn-ghost border border-slate-300 dark:border-slate-700"
+            onClick={pickImport}
           >
-            <option value="merge-yjs">Merge (Yjs CRDT — safest)</option>
-            <option value="merge-records">Merge by record ID</option>
-            <option value="replace">Replace all entries</option>
-          </select>
-          <button className="btn-ghost border border-slate-300 dark:border-slate-700" onClick={pickImport}>
-            Import JSON file
+            Import update from {partnerName}
           </button>
           <input
             ref={fileRef}
             type="file"
-            accept="application/json"
+            accept=".spendtrack,.json,application/json,application/spendtrack+json"
             className="hidden"
             onChange={onFile}
           />
-        </div>
+        </section>
+      )}
+
+      <section className="card flex flex-col gap-3 p-4">
+        <h2 className="font-semibold">Local backup</h2>
+        <p className="text-sm text-slate-600 dark:text-slate-300">
+          For your own records — unencrypted JSON you can store anywhere. Don&rsquo;t share this
+          with anyone untrusted; it contains all your expense data in plaintext.
+        </p>
+        <button
+          className="btn-ghost border border-slate-300 dark:border-slate-700"
+          onClick={downloadPlainJson}
+        >
+          Download plain JSON backup
+        </button>
         <p className="text-xs text-slate-500 dark:text-slate-400">
-          The export format is documented at{' '}
+          Format documented at{' '}
           <a
             href="https://github.com/phonepvr/spendtrack/blob/main/docs/SCHEMA.md"
             target="_blank"
@@ -159,25 +194,18 @@ export function SettingsScreen({ bundle, settings, onClose, onUnpair }: Props) {
             className="underline"
           >
             docs/SCHEMA.md
-          </a>{' '}
-          so you can recover your data without the app.
+          </a>
+          .
         </p>
       </section>
 
       <section className="card flex flex-col gap-2 p-4">
-        <h2 className="font-semibold">What this app shares</h2>
+        <h2 className="font-semibold">What we share with the world</h2>
         <p className="text-sm text-slate-600 dark:text-slate-300">
-          Signaling servers help your two phones find each other. They see a derived room ID and
-          your IP address. They never see your passphrase or any expense data — those are
-          end-to-end encrypted using a key derived from your passphrase.
+          Nothing. There are no servers. Your data stays on your phone unless you explicitly tap
+          &ldquo;Send update&rdquo; — and even then, the file is encrypted with your passphrase, so
+          whatever messenger or cloud it passes through can&rsquo;t read it.
         </p>
-        <ul className="mt-1 list-disc pl-5 text-xs text-slate-500 dark:text-slate-400">
-          {SIGNALING_SERVERS.map((url) => (
-            <li key={url} className="font-mono">
-              {url}
-            </li>
-          ))}
-        </ul>
       </section>
 
       <section className="card flex flex-col gap-3 p-4">
